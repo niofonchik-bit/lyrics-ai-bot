@@ -214,36 +214,115 @@ export function createAiService({
         return response.output_text.trim();
     }
 
-    async function explainSong(song) {
-        return createStructuredResponse({
+
+
+    async function researchSongContext(song) {
+        const response = await openai.responses.create({
+            model: textModel,
+            store: false,
+            tools: [
+                {
+                    type: 'web_search',
+                    search_context_size: 'medium',
+                },
+            ],
+            tool_choice: 'required',
+            include: ['web_search_call.action.sources'],
+            max_output_tokens: 1800,
+            instructions: `
+Найди проверяемый контекст песни для последующего смыслового анализа.
+
+Изучи только сведения, которые могут влиять на понимание текста:
+- официальные комментарии исполнителя, авторов и продюсеров;
+- интервью о песне или альбоме;
+- обстоятельства создания и выпуска;
+- подтверждённые культурные, исторические и языковые отсылки;
+- значения имён, терминов, сленга и образов;
+- авторские кредиты и достоверные материалы музыкальных изданий.
+
+Приоритет источников:
+1. официальные страницы исполнителя, лейбла и издателя;
+2. интервью с прямыми цитатами исполнителя или авторов;
+3. надёжные музыкальные и новостные издания;
+4. справочные источники для отдельных терминов и событий.
+
+Не используй фанатские теории как установленные факты.
+Не считай содержание клипа объяснением текста, если связь не подтверждена.
+Не подгоняй биографию исполнителя под песню.
+Если достоверного контекста нет, прямо укажи это.
+Отделяй подтверждённые факты от интерпретаций.
+
+Верни краткую исследовательскую справку без Markdown.
+        `.trim(),
+            input: `
+Исполнитель: ${song.artistName}
+Песня: ${song.trackName}
+Альбом: ${song.albumName || 'неизвестен'}
+        `.trim(),
+        });
+
+        return {
+            text: response.output_text.trim(),
+            sources: extractWebSources(response).slice(0, 6),
+        };
+    }
+
+    async function explainSong(song, useWebContext = false) {
+        const research = useWebContext
+            ? await researchSongContext(song)
+            : {
+                text: 'Дополнительный веб-контекст не запрашивался.',
+                sources: [],
+            };
+
+        const explanation = await createStructuredResponse({
             model: textModel,
             schema: songExplanationSchema,
             schemaName: 'song_explanation',
-            maxOutputTokens: 1400,
+            maxOutputTokens: 1600,
             instructions: `
 Объясни смысл песни понятным русским языком.
 
+Используй:
+- сам текст песни как основной источник;
+- найденный открытый контекст только там, где он действительно помогает;
+- подтверждённые комментарии исполнителя или авторов;
+- сведения об исторических, культурных и языковых отсылках.
+
+Строго разделяй:
+- факты, подтверждённые источниками;
+- наиболее вероятное прочтение текста;
+- неоднозначные или возможные трактовки.
+
+Не объясняй песню исключительно через биографию исполнителя.
+Не выдавай совпадение с событиями жизни исполнителя за доказанный замысел.
+Не используй фанатские теории как факты.
+Если открытые источники не подтверждают конкретную трактовку, прямо скажи об этом.
+Если публичного объяснения автора нет, анализируй текст самостоятельно, но обозначай это как интерпретацию.
+
 Требования к ответу:
-- отвечай чётко и по делу;
 - сначала сформулируй главную мысль;
-- затем дай от 2 до 3 содержательных разделов;
-- в каждом разделе используй не больше 3 коротких пунктов;
-- общий объём — примерно 250-450 слов;
+- затем дай от 2 до 4 содержательных разделов;
 - не пересказывай песню построчно;
-- не повторяй одну мысль разными словами;
-- не добавляй предложение продолжить разбор или сделать ещё что-либо;
-- не используй Markdown и HTML: форматирование выполнит код бота;
-- не называй трактовку официальной, если это не следует из текста;
-- не выдумывай биографические факты, намерения автора и сюжет клипа;
-- короткие фрагменты текста упоминай только при необходимости и не цитируй песню большими отрывками.
-            `.trim(),
+- избегай повторов и общих фраз;
+- не используй Markdown или HTML;
+- не добавляй предложение продолжить разговор.
+        `.trim(),
             input: `
 Песня: ${song.artistName} — ${song.trackName}
 
 Текст:
 ${limitInput(song.lyrics)}
-            `.trim(),
+
+Контекст из открытых источников:
+${limitInput(research.text, 10000)}
+        `.trim(),
         });
+
+        return {
+            ...explanation,
+            sources: research.sources,
+        };
     }
 
     async function explainFragment(fragment, song) {
@@ -280,6 +359,24 @@ ${songContext}
 ${limitInput(fragment, 3000)}
             `.trim(),
         });
+    }
+
+    function extractWebSources(response) {
+        const sources = response.output
+            .filter(item => item.type === 'message')
+            .flatMap(item => item.content || [])
+            .flatMap(content => content.annotations || [])
+            .filter(annotation => annotation.type === 'url_citation')
+            .map(annotation => ({
+                title: annotation.title,
+                url: annotation.url,
+            }));
+
+        return [
+            ...new Map(
+                sources.map(source => [source.url, source]),
+            ).values(),
+        ];
     }
 
     return {

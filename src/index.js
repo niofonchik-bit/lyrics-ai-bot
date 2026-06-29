@@ -273,6 +273,27 @@ async function runSongAction(chatId, action, options = {}) {
         return;
     }
 
+    if (action === 'deep_explain') {
+        const explanation = await withProgress(
+            chatId,
+            [
+                'Ищу интервью и историю песни…',
+                'Проверяю отсылки и контекст…',
+                'Сопоставляю источники с текстом…',
+                'Формирую глубокий разбор…',
+            ],
+            () => ai.explainSong(song, true),
+        );
+
+        await sendHtmlMessages(
+            chatId,
+            renderSongExplanation(song, explanation),
+            createSongActionsKeyboard(),
+        );
+
+        return;
+    }
+
     if (action === 'explain_fragment') {
         if (!options.fragment) {
             await sendTrackedMessage(
@@ -603,6 +624,11 @@ async function handleCallbackQuery(callbackQuery) {
         await telegram.answerCallbackQuery(callbackQuery.id, 'Начинаю разбор');
         await runSongAction(chatId, 'explain_song');
         return;
+    }
+
+    if (data === 'action:deep_explain') {
+        await telegram.answerCallbackQuery(callbackQuery.id, 'Начинаю разбор');
+        await runSongAction(chatId, 'deep_explain');
     }
 
     await telegram.answerCallbackQuery(callbackQuery.id);

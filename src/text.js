@@ -69,6 +69,12 @@ export function createSongActionsKeyboard() {
             ],
             [
                 {
+                    text: '🔎 Глубокий разбор',
+                    callback_data: 'action:deep_explain',
+                },
+            ],
+            [
+                {
                     text: '🗑 Очистить чат',
                     callback_data: 'chat:clear',
                 },
@@ -118,6 +124,17 @@ export function renderSongExplanation(song, explanation) {
     }
 
     blocks.push(...createParagraphBlocks('Итог', explanation.conclusion));
+
+    if (explanation.sources?.length) {
+        const sources = explanation.sources
+            .map((source, index) => (
+                `${index + 1}. <a href="${escapeHtml(source.url)}">`
+                + `${escapeHtml(source.title || source.url)}</a>`
+            ))
+            .join('\n');
+
+        blocks.push(`<b>Источники</b>\n${sources}`);
+    }
 
     return packHtmlBlocks(blocks);
 }
