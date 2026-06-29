@@ -1,12 +1,22 @@
 import { config } from './config.js';
 import { createAiService } from './ai.js';
+import { getUserErrorMessage } from './errors.js';
 import { searchLyrics } from './lyrics.js';
-import { getSession } from './session.js';
+import {
+    getSession,
+    resetSession,
+    trackMessage,
+    untrackMessage,
+} from './session.js';
 import { createTelegramClient } from './telegram.js';
 import {
+    createClearKeyboard,
     createSearchKeyboard,
     createSongActionsKeyboard,
+    escapeHtml,
     formatSongTitle,
+    renderFragmentExplanation,
+    renderSongExplanation,
     splitText,
 } from './text.js';
 
@@ -17,41 +27,146 @@ const ai = createAiService({
     textModel: config.textModel,
 });
 
-const helpText = `
-Я умею искать тексты песен и обсуждать их обычным языком.
+const commands = [
+    { command: 'start', description: 'Запустить бота' },
+    { command: 'search', description: 'Найти песню по названию' },
+    { command: 'current', description: 'Показать выбранную песню' },
+    { command: 'translate', description: 'Перевести выбранную песню' },
+    { command: 'explain', description: 'Объяснить смысл выбранной песни' },
+    { command: 'clear', description: 'Очистить сообщения этого диалога' },
+    { command: 'help', description: 'Показать примеры запросов' },
+];
 
-Примеры:
+const helpText = `
+<b>Я умею искать тексты песен и разбирать их смысл.</b>
+
+<b>Примеры:</b>
 • Numb Linkin Park
 • найди текст The Emptiness Machine
 • переведи Numb от Linkin Park
 • переведи эту песню
 • объясни смысл песни
-• что значит фраза "I've become so numb"
+• что значит фраза «I've become so numb»
 • переведи: I tried so hard and got so far
 
-После выбора песни я запоминаю её до перезапуска бота.
+После выбора песни я запоминаю её до перезапуска бота или команды /clear.
 `.trim();
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-async function sendLongMessage(chatId, text) {
-    for (const chunk of splitText(text)) {
-        await telegram.sendMessage(chatId, chunk);
+async function sendTrackedMessage(chatId, text, options = {}) {
+    const message = await telegram.sendMessage(chatId, text, options);
+    trackMessage(chatId, message.message_id);
+    return message;
+}
+
+async function deleteMessageQuietly(chatId, messageId) {
+    try {
+        await telegram.deleteMessage(chatId, messageId);
+    } catch (error) {
+        console.warn(`Не удалось удалить сообщение ${messageId}:`, error.message);
+    } finally {
+        untrackMessage(chatId, messageId);
+    }
+}
+
+async function sendLongPlainMessage(chatId, text, replyMarkup) {
+    const chunks = splitText(text);
+
+    for (const [index, chunk] of chunks.entries()) {
+        const isLast = index === chunks.length - 1;
+
+        await sendTrackedMessage(chatId, chunk, {
+            ...(isLast && replyMarkup ? { reply_markup: replyMarkup } : {}),
+        });
+    }
+}
+
+async function sendHtmlMessages(chatId, messages, replyMarkup) {
+    for (const [index, message] of messages.entries()) {
+        const isLast = index === messages.length - 1;
+
+        await sendTrackedMessage(chatId, message, {
+            parse_mode: 'HTML',
+            ...(isLast && replyMarkup ? { reply_markup: replyMarkup } : {}),
+        });
+    }
+}
+
+async function withProgress(chatId, steps, task) {
+    const normalizedSteps = steps.length ? steps : ['Обрабатываю запрос…'];
+    let stepIndex = 0;
+
+    const statusMessage = await sendTrackedMessage(
+        chatId,
+        `<b>⏳ ${escapeHtml(normalizedSteps[0])}</b>`,
+        { parse_mode: 'HTML' },
+    );
+
+    await telegram.sendChatAction(chatId).catch(() => {});
+
+    const actionTimer = setInterval(() => {
+        telegram.sendChatAction(chatId).catch(() => {});
+    }, 4000);
+
+    const progressTimer = setInterval(() => {
+        if (stepIndex >= normalizedSteps.length - 1) {
+            return;
+        }
+
+        stepIndex += 1;
+
+        telegram.editMessageText(
+            chatId,
+            statusMessage.message_id,
+            `<b>⏳ ${escapeHtml(normalizedSteps[stepIndex])}</b>`,
+            { parse_mode: 'HTML' },
+        ).catch(() => {});
+    }, 5500);
+
+    try {
+        return await task();
+    } finally {
+        clearInterval(actionTimer);
+        clearInterval(progressTimer);
+        await deleteMessageQuietly(chatId, statusMessage.message_id);
+    }
+}
+
+async function clearChat(chatId) {
+    const session = getSession(chatId);
+    const messageIds = [...session.messageIds].sort((a, b) => b - a);
+
+    resetSession(chatId);
+
+    for (const messageId of messageIds) {
+        try {
+            await telegram.deleteMessage(chatId, messageId);
+        } catch (error) {
+            console.warn(`Не удалось удалить сообщение ${messageId}:`, error.message);
+        }
     }
 }
 
 async function showSong(chatId, song) {
-    await telegram.sendMessage(chatId, `🎵 ${formatSongTitle(song)}`);
+    await sendTrackedMessage(
+        chatId,
+        `<b>🎵 ${escapeHtml(formatSongTitle(song))}</b>`,
+        { parse_mode: 'HTML' },
+    );
 
     if (song.instrumental && !song.lyrics) {
-        await telegram.sendMessage(chatId, 'У этой композиции нет вокального текста.');
+        await sendTrackedMessage(
+            chatId,
+            'У этой композиции нет вокального текста.',
+            { reply_markup: createClearKeyboard() },
+        );
         return;
     }
 
-    await sendLongMessage(chatId, song.lyrics);
-    await telegram.sendMessage(
+    await sendLongPlainMessage(
         chatId,
-        'Можно попросить перевод, общий разбор или объяснение отдельной строки.',
+        song.lyrics,
         createSongActionsKeyboard(),
     );
 }
@@ -62,13 +177,18 @@ async function showSearchResults(chatId, songs, pendingAction = null) {
     session.pendingAction = pendingAction;
 
     const list = songs
-        .map((song, index) => `${index + 1}. ${formatSongTitle(song)}`)
+        .map((song, index) => (
+            `${index + 1}. ${escapeHtml(formatSongTitle(song))}`
+        ))
         .join('\n');
 
-    await telegram.sendMessage(
+    await sendTrackedMessage(
         chatId,
-        `Нашёл несколько вариантов:\n\n${list}\n\nВыбери нужный:`,
-        createSearchKeyboard(songs),
+        `<b>Нашёл несколько вариантов:</b>\n\n${list}\n\nВыбери нужный:`,
+        {
+            parse_mode: 'HTML',
+            reply_markup: createSearchKeyboard(songs),
+        },
     );
 }
 
@@ -89,70 +209,110 @@ async function runSongAction(chatId, action, options = {}) {
     const song = session.activeSong;
 
     if (!song) {
-        await telegram.sendMessage(
+        await sendTrackedMessage(
             chatId,
             'Сначала укажи название песни или выбери её из результатов поиска.',
+            { reply_markup: createClearKeyboard() },
         );
         return;
     }
 
     if (!song.lyrics) {
-        await telegram.sendMessage(
+        await sendTrackedMessage(
             chatId,
             'У выбранной композиции нет текста для обработки.',
+            { reply_markup: createClearKeyboard() },
         );
         return;
     }
 
-    await telegram.sendChatAction(chatId);
-
     if (action === 'translate') {
-        const translation = await ai.translateText(
-            song.lyrics,
-            options.targetLanguage || 'русский',
+        const translation = await withProgress(
+            chatId,
+            [
+                'Перевожу текст песни…',
+                'Сохраняю смысл и структуру…',
+                'Подготавливаю перевод…',
+            ],
+            () => ai.translateText(
+                song.lyrics,
+                options.targetLanguage || 'русский',
+            ),
         );
 
-        await telegram.sendMessage(
+        await sendTrackedMessage(
             chatId,
-            `🌍 Перевод: ${formatSongTitle(song)}`,
+            `<b>🌍 Перевод: ${escapeHtml(formatSongTitle(song))}</b>`,
+            { parse_mode: 'HTML' },
         );
-        await sendLongMessage(chatId, translation);
+
+        await sendLongPlainMessage(
+            chatId,
+            translation,
+            createSongActionsKeyboard(),
+        );
         return;
     }
 
     if (action === 'explain_song') {
-        const explanation = await ai.explainSong(song);
-
-        await telegram.sendMessage(
+        const explanation = await withProgress(
             chatId,
-            `💡 Смысл песни: ${formatSongTitle(song)}`,
+            [
+                'Анализирую смысл песни…',
+                'Выделяю основные темы и образы…',
+                'Формирую краткий разбор…',
+            ],
+            () => ai.explainSong(song),
         );
-        await sendLongMessage(chatId, explanation);
+
+        await sendHtmlMessages(
+            chatId,
+            renderSongExplanation(song, explanation),
+            createSongActionsKeyboard(),
+        );
         return;
     }
 
     if (action === 'explain_fragment') {
         if (!options.fragment) {
-            await telegram.sendMessage(
+            await sendTrackedMessage(
                 chatId,
                 'Пришли строку и напиши, например: «что значит эта фраза?»',
+                { reply_markup: createClearKeyboard() },
             );
             return;
         }
 
-        const explanation = await ai.explainFragment(options.fragment, song);
-        await sendLongMessage(chatId, explanation);
+        const explanation = await withProgress(
+            chatId,
+            [
+                'Разбираю фразу…',
+                'Проверяю её контекст…',
+                'Формулирую объяснение…',
+            ],
+            () => ai.explainFragment(options.fragment, song),
+        );
+
+        await sendHtmlMessages(
+            chatId,
+            renderFragmentExplanation(options.fragment, explanation),
+            createSongActionsKeyboard(),
+        );
     }
 }
 
 async function searchAndContinue(chatId, intent, pendingAction = null) {
-    await telegram.sendChatAction(chatId);
-    const songs = await findSongs(intent);
+    const songs = await withProgress(
+        chatId,
+        ['Ищу песню…', 'Проверяю найденные варианты…'],
+        () => findSongs(intent),
+    );
 
     if (!songs.length) {
-        await telegram.sendMessage(
+        await sendTrackedMessage(
             chatId,
-            'Не нашёл подходящий текст. Попробуй добавить исполнителя или проверить название.',
+            'Не нашёл подходящий текст. Добавь исполнителя или проверь название.',
+            { reply_markup: createClearKeyboard() },
         );
         return;
     }
@@ -173,6 +333,87 @@ async function searchAndContinue(chatId, intent, pendingAction = null) {
     await showSearchResults(chatId, songs, pendingAction);
 }
 
+function parseCommand(text) {
+    const match = text.match(/^\/([a-z_]+)(?:@\w+)?(?:\s+([\s\S]*))?$/i);
+
+    if (!match) {
+        return null;
+    }
+
+    return {
+        name: match[1].toLowerCase(),
+        args: match[2]?.trim() || '',
+    };
+}
+
+async function handleCommand(chatId, command) {
+    if (command.name === 'start' || command.name === 'help') {
+        await sendTrackedMessage(chatId, helpText, {
+            parse_mode: 'HTML',
+            reply_markup: createClearKeyboard(),
+        });
+        return;
+    }
+
+    if (command.name === 'search') {
+        if (!command.args) {
+            await sendTrackedMessage(
+                chatId,
+                'После команды укажи название: /search Numb Linkin Park',
+                { reply_markup: createClearKeyboard() },
+            );
+            return;
+        }
+
+        await searchAndContinue(chatId, {
+            query: command.args,
+            trackName: '',
+            artistName: '',
+        });
+        return;
+    }
+
+    if (command.name === 'current') {
+        const song = getSession(chatId).activeSong;
+
+        await sendTrackedMessage(
+            chatId,
+            song
+                ? `<b>Текущая песня:</b> ${escapeHtml(formatSongTitle(song))}`
+                : 'Сейчас песня не выбрана.',
+            {
+                parse_mode: 'HTML',
+                reply_markup: song
+                    ? createSongActionsKeyboard()
+                    : createClearKeyboard(),
+            },
+        );
+        return;
+    }
+
+    if (command.name === 'translate') {
+        await runSongAction(chatId, 'translate', {
+            targetLanguage: command.args || 'русский',
+        });
+        return;
+    }
+
+    if (command.name === 'explain') {
+        await runSongAction(chatId, 'explain_song');
+        return;
+    }
+
+    if (command.name === 'clear') {
+        await clearChat(chatId);
+        return;
+    }
+
+    await sendTrackedMessage(chatId, helpText, {
+        parse_mode: 'HTML',
+        reply_markup: createClearKeyboard(),
+    });
+}
+
 async function handleMessage(message) {
     const chatId = message.chat.id;
     const text = message.text?.trim();
@@ -181,18 +422,25 @@ async function handleMessage(message) {
         return;
     }
 
-    if (text.startsWith('/start') || text.startsWith('/help')) {
-        await telegram.sendMessage(chatId, helpText);
+    trackMessage(chatId, message.message_id);
+
+    const command = parseCommand(text);
+
+    if (command) {
+        await handleCommand(chatId, command);
         return;
     }
 
     const session = getSession(chatId);
-    await telegram.sendChatAction(chatId);
+    await telegram.sendChatAction(chatId).catch(() => {});
 
     const intent = await ai.routeMessage(text, session.activeSong);
 
     if (intent.action === 'help') {
-        await telegram.sendMessage(chatId, helpText);
+        await sendTrackedMessage(chatId, helpText, {
+            parse_mode: 'HTML',
+            reply_markup: createClearKeyboard(),
+        });
         return;
     }
 
@@ -203,12 +451,20 @@ async function handleMessage(message) {
 
     if (intent.action === 'translate') {
         if (intent.sourceText) {
-            const translation = await ai.translateText(
-                intent.sourceText,
-                intent.targetLanguage || 'русский',
+            const translation = await withProgress(
+                chatId,
+                ['Перевожу текст…', 'Подготавливаю результат…'],
+                () => ai.translateText(
+                    intent.sourceText,
+                    intent.targetLanguage || 'русский',
+                ),
             );
 
-            await sendLongMessage(chatId, translation);
+            await sendLongPlainMessage(
+                chatId,
+                translation,
+                createClearKeyboard(),
+            );
             return;
         }
 
@@ -242,9 +498,10 @@ async function handleMessage(message) {
         const fragment = intent.fragment || intent.sourceText;
 
         if (!fragment) {
-            await telegram.sendMessage(
+            await sendTrackedMessage(
                 chatId,
                 'Пришли конкретную строку или фразу, которую нужно объяснить.',
+                { reply_markup: createClearKeyboard() },
             );
             return;
         }
@@ -257,43 +514,66 @@ async function handleMessage(message) {
             return;
         }
 
-        const explanation = await ai.explainFragment(
-            fragment,
-            session.activeSong,
+        const explanation = await withProgress(
+            chatId,
+            ['Разбираю фразу…', 'Формулирую объяснение…'],
+            () => ai.explainFragment(fragment, session.activeSong),
         );
 
-        await sendLongMessage(chatId, explanation);
+        await sendHtmlMessages(
+            chatId,
+            renderFragmentExplanation(fragment, explanation),
+            session.activeSong
+                ? createSongActionsKeyboard()
+                : createClearKeyboard(),
+        );
         return;
     }
 
-    await telegram.sendMessage(chatId, helpText);
+    await sendTrackedMessage(
+        chatId,
+        'Я могу найти песню, перевести её или объяснить смысл. Используй /help для примеров.',
+        { reply_markup: createClearKeyboard() },
+    );
 }
 
 async function handleCallbackQuery(callbackQuery) {
     const chatId = callbackQuery.message?.chat.id;
+    const messageId = callbackQuery.message?.message_id;
     const data = callbackQuery.data || '';
 
     if (!chatId) {
         return;
     }
 
-    await telegram.answerCallbackQuery(callbackQuery.id);
+    if (data === 'chat:clear') {
+        await telegram.answerCallbackQuery(callbackQuery.id, 'Очищаю сообщения…');
+        await clearChat(chatId);
+        return;
+    }
 
     const session = getSession(chatId);
 
     if (data.startsWith('pick:')) {
+        await telegram.answerCallbackQuery(callbackQuery.id, 'Песня выбрана');
+
         const index = Number(data.slice('pick:'.length));
         const song = session.searchResults[index];
 
         if (!song) {
-            await telegram.sendMessage(
+            await sendTrackedMessage(
                 chatId,
                 'Результаты поиска устарели. Повтори запрос.',
+                { reply_markup: createClearKeyboard() },
             );
             return;
         }
 
         session.activeSong = song;
+
+        if (messageId) {
+            await deleteMessageQuietly(chatId, messageId);
+        }
 
         const pendingAction = session.pendingAction;
         session.pendingAction = null;
@@ -312,6 +592,7 @@ async function handleCallbackQuery(callbackQuery) {
     }
 
     if (data === 'action:translate') {
+        await telegram.answerCallbackQuery(callbackQuery.id, 'Начинаю перевод');
         await runSongAction(chatId, 'translate', {
             targetLanguage: 'русский',
         });
@@ -319,8 +600,12 @@ async function handleCallbackQuery(callbackQuery) {
     }
 
     if (data === 'action:explain_song') {
+        await telegram.answerCallbackQuery(callbackQuery.id, 'Начинаю разбор');
         await runSongAction(chatId, 'explain_song');
+        return;
     }
+
+    await telegram.answerCallbackQuery(callbackQuery.id);
 }
 
 async function handleUpdate(update) {
@@ -341,17 +626,29 @@ async function handleUpdate(update) {
             update.callback_query?.message?.chat.id;
 
         if (chatId) {
-            await telegram.sendMessage(
+            await sendTrackedMessage(
                 chatId,
-                'Не удалось обработать запрос. Попробуй ещё раз немного позже.',
-            );
+                getUserErrorMessage(error),
+                { reply_markup: createClearKeyboard() },
+            ).catch(console.error);
         }
+    }
+}
+
+async function configureBot() {
+    try {
+        await telegram.setMyCommands(commands);
+        await telegram.setChatMenuButton();
+        console.log('Меню команд Telegram настроено');
+    } catch (error) {
+        console.error('Не удалось настроить меню команд:', error);
     }
 }
 
 async function startPolling() {
     let offset = 0;
 
+    await configureBot();
     console.log('Lyrics AI Bot запущен');
 
     while (true) {

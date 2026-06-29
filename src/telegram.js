@@ -13,9 +13,13 @@ export function createTelegramClient(token) {
         const data = await response.json();
 
         if (!response.ok || !data.ok) {
-            throw new Error(
+            const error = new Error(
                 `Telegram ${method}: ${data.description || response.statusText}`,
             );
+
+            error.status = response.status;
+            error.description = data.description;
+            throw error;
         }
 
         return data.result;
@@ -30,11 +34,27 @@ export function createTelegramClient(token) {
             });
         },
 
-        sendMessage(chatId, text, replyMarkup) {
+        sendMessage(chatId, text, options = {}) {
             return request('sendMessage', {
                 chat_id: chatId,
                 text,
-                ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+                ...options,
+            });
+        },
+
+        editMessageText(chatId, messageId, text, options = {}) {
+            return request('editMessageText', {
+                chat_id: chatId,
+                message_id: messageId,
+                text,
+                ...options,
+            });
+        },
+
+        deleteMessage(chatId, messageId) {
+            return request('deleteMessage', {
+                chat_id: chatId,
+                message_id: messageId,
             });
         },
 
@@ -49,6 +69,18 @@ export function createTelegramClient(token) {
             return request('answerCallbackQuery', {
                 callback_query_id: callbackQueryId,
                 ...(text ? { text } : {}),
+            });
+        },
+
+        setMyCommands(commands) {
+            return request('setMyCommands', { commands });
+        },
+
+        setChatMenuButton() {
+            return request('setChatMenuButton', {
+                menu_button: {
+                    type: 'commands',
+                },
             });
         },
     };
