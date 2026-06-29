@@ -31,6 +31,34 @@ export function escapeHtml(value = '') {
         .replaceAll('>', '&gt;');
 }
 
+function escapeHtmlAttribute(value = '') {
+    return escapeHtml(value)
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+}
+
+function getSafeUrl(value) {
+    try {
+        const url = new URL(value);
+
+        return ['http:', 'https:'].includes(url.protocol)
+            ? url.toString()
+            : '';
+    } catch {
+        return '';
+    }
+}
+
+function createLink(text, url) {
+    const safeUrl = getSafeUrl(url);
+
+    if (!safeUrl) {
+        return escapeHtml(text);
+    }
+
+    return `<a href="${escapeHtmlAttribute(safeUrl)}">${escapeHtml(text)}</a>`;
+}
+
 export function formatSongTitle(song) {
     return `${song.artistName} — ${song.trackName}`;
 }
@@ -72,6 +100,10 @@ export function createSongActionsKeyboard() {
                     text: '🔎 Глубокий разбор',
                     callback_data: 'action:deep_explain',
                 },
+                {
+                    text: '👥 Авторы',
+                    callback_data: 'action:credits',
+                },
             ],
             [
                 {
@@ -108,32 +140,41 @@ function createParagraphBlocks(title, text) {
     });
 }
 
+function renderSources(sources) {
+    if (!sources?.length) {
+        return '';
+    }
+
+    const links = sources
+        .map((source, index) => (
+            `${index + 1}. ${createLink(source.title || source.url, source.url)}`
+        ))
+        .join('\n');
+
+    return `<b>Источники</b>\n${links}`;
+}
+
 export function renderSongExplanation(song, explanation) {
     const blocks = [
         `<b>💡 Смысл песни: ${escapeHtml(formatSongTitle(song))}</b>`,
-        ...createParagraphBlocks('', explanation.summary),
     ];
 
-    for (const section of explanation.sections) {
-        const sectionText = [
-            section.explanation,
-            ...section.points.map(point => `• ${point}`),
-        ].filter(Boolean).join('\n');
-
-        blocks.push(...createParagraphBlocks(section.title, sectionText));
+    for (const paragraph of explanation.paragraphs || []) {
+        blocks.push(...createParagraphBlocks('', paragraph));
     }
 
-    blocks.push(...createParagraphBlocks('Итог', explanation.conclusion));
+    for (const detail of explanation.details || []) {
+        blocks.push(...createParagraphBlocks(detail.title, detail.text));
+    }
 
-    if (explanation.sources?.length) {
-        const sources = explanation.sources
-            .map((source, index) => (
-                `${index + 1}. <a href="${escapeHtml(source.url)}">`
-                + `${escapeHtml(source.title || source.url)}</a>`
-            ))
-            .join('\n');
+    if (explanation.sourceNote) {
+        blocks.push(`<i>${escapeHtml(explanation.sourceNote)}</i>`);
+    }
 
-        blocks.push(`<b>Источники</b>\n${sources}`);
+    const sources = renderSources(explanation.sources);
+
+    if (sources) {
+        blocks.push(sources);
     }
 
     return packHtmlBlocks(blocks);
@@ -142,11 +183,69 @@ export function renderSongExplanation(song, explanation) {
 export function renderFragmentExplanation(fragment, explanation) {
     const blocks = [
         `<b>🔎 Разбор фразы</b>\n<blockquote>${escapeHtml(fragment)}</blockquote>`,
-        ...createParagraphBlocks('Буквальный смысл', explanation.literalMeaning),
-        ...createParagraphBlocks('Смысл в контексте', explanation.contextualMeaning),
-        ...createParagraphBlocks('Оттенок и образ', explanation.nuance),
-        ...createParagraphBlocks('Коротко', explanation.conclusion),
     ];
+
+    if (explanation.literalTranslation) {
+        blocks.push(
+            `<b>Буквально:</b> ${escapeHtml(explanation.literalTranslation)}`,
+        );
+    }
+
+    blocks.push(...createParagraphBlocks('', explanation.explanation));
+
+    if (explanation.alternatives?.length) {
+        const alternatives = explanation.alternatives
+            .map(item => `• ${escapeHtml(item)}`)
+            .join('\n');
+
+        blocks.push(`<b>Другие варианты</b>\n${alternatives}`);
+    }
+
+    return packHtmlBlocks(blocks);
+}
+
+export function renderSongCredits(song, credits) {
+    const blocks = [
+        `<b>👥 Авторы и участники: ${escapeHtml(formatSongTitle(song))}</b>`,
+    ];
+
+    if (credits.summary) {
+        blocks.push(...createParagraphBlocks('', credits.summary));
+    }
+
+    if (!credits.contributors?.length) {
+        blocks.push('Не удалось найти подтверждённые персональные кредиты.');
+    }
+
+    for (const contributor of credits.contributors || []) {
+        const linkIndex = contributor.profileSourceIndex
+            || contributor.creditSourceIndexes?.[0]
+            || 0;
+        const source = linkIndex > 0
+            ? credits.sources?.[linkIndex - 1]
+            : null;
+        const name = source
+            ? createLink(contributor.name, source.url)
+            : escapeHtml(contributor.name);
+        const roles = contributor.roles?.length
+            ? escapeHtml(contributor.roles.join(', '))
+            : 'роль не уточнена';
+        const note = contributor.note
+            ? `\n<i>${escapeHtml(contributor.note)}</i>`
+            : '';
+
+        blocks.push(`<b>${name}</b> — ${roles}${note}`);
+    }
+
+    if (credits.sourceNote) {
+        blocks.push(`<i>${escapeHtml(credits.sourceNote)}</i>`);
+    }
+
+    const sources = renderSources(credits.sources);
+
+    if (sources) {
+        blocks.push(sources);
+    }
 
     return packHtmlBlocks(blocks);
 }

@@ -17,6 +17,7 @@ import {
     formatSongTitle,
     renderFragmentExplanation,
     renderSongExplanation,
+    renderSongCredits,
     splitText,
 } from './text.js';
 
@@ -33,6 +34,7 @@ const commands = [
     { command: 'current', description: 'Показать выбранную песню' },
     { command: 'translate', description: 'Перевести выбранную песню' },
     { command: 'explain', description: 'Объяснить смысл выбранной песни' },
+    { command: 'credits', description: 'Показать авторов и участников записи' },
     { command: 'clear', description: 'Очистить сообщения этого диалога' },
     { command: 'help', description: 'Показать примеры запросов' },
 ];
@@ -46,6 +48,7 @@ const helpText = `
 • переведи Numb от Linkin Park
 • переведи эту песню
 • объясни смысл песни
+• покажи авторов песни
 • что значит фраза «I've become so numb»
 • переведи: I tried so hard and got so far
 
@@ -217,7 +220,14 @@ async function runSongAction(chatId, action, options = {}) {
         return;
     }
 
-    if (!song.lyrics) {
+    const requiresLyrics = [
+        'translate',
+        'explain_song',
+        'deep_explain',
+        'explain_fragment',
+    ].includes(action);
+
+    if (requiresLyrics && !song.lyrics) {
         await sendTrackedMessage(
             chatId,
             'У выбранной композиции нет текста для обработки.',
@@ -291,6 +301,25 @@ async function runSongAction(chatId, action, options = {}) {
             createSongActionsKeyboard(),
         );
 
+        return;
+    }
+
+    if (action === 'credits') {
+        const credits = await withProgress(
+            chatId,
+            [
+                'Ищу официальные кредиты…',
+                'Собираю авторов и участников записи…',
+                'Проверяю роли и источники…',
+            ],
+            () => ai.getSongCredits(song),
+        );
+
+        await sendHtmlMessages(
+            chatId,
+            renderSongCredits(song, credits),
+            createSongActionsKeyboard(),
+        );
         return;
     }
 
@@ -424,6 +453,11 @@ async function handleCommand(chatId, command) {
         return;
     }
 
+    if (command.name === 'credits') {
+        await runSongAction(chatId, 'credits');
+        return;
+    }
+
     if (command.name === 'clear') {
         await clearChat(chatId);
         return;
@@ -515,6 +549,18 @@ async function handleMessage(message) {
         return;
     }
 
+    if (intent.action === 'credits') {
+        if (hasSongSearch(intent)) {
+            await searchAndContinue(chatId, intent, {
+                action: 'credits',
+            });
+            return;
+        }
+
+        await runSongAction(chatId, 'credits');
+        return;
+    }
+
     if (intent.action === 'explain_fragment') {
         const fragment = intent.fragment || intent.sourceText;
 
@@ -558,6 +604,22 @@ async function handleMessage(message) {
     );
 }
 
+async function answerCallbackQueryQuietly(callbackQueryId) {
+    try {
+        await telegram.answerCallbackQuery(callbackQueryId);
+    } catch (error) {
+        const description = error?.description || error?.message || '';
+        const isExpired = (
+            description.includes('query is too old')
+            || description.includes('query ID is invalid')
+        );
+
+        if (!isExpired) {
+            console.warn('Не удалось подтвердить нажатие кнопки:', description);
+        }
+    }
+}
+
 async function handleCallbackQuery(callbackQuery) {
     const chatId = callbackQuery.message?.chat.id;
     const messageId = callbackQuery.message?.message_id;
@@ -567,8 +629,10 @@ async function handleCallbackQuery(callbackQuery) {
         return;
     }
 
+    // callback нужно подтвердить сразу: Telegram хранит его недолго
+    await answerCallbackQueryQuietly(callbackQuery.id);
+
     if (data === 'chat:clear') {
-        await telegram.answerCallbackQuery(callbackQuery.id, 'Очищаю сообщения…');
         await clearChat(chatId);
         return;
     }
@@ -576,8 +640,6 @@ async function handleCallbackQuery(callbackQuery) {
     const session = getSession(chatId);
 
     if (data.startsWith('pick:')) {
-        await telegram.answerCallbackQuery(callbackQuery.id, 'Песня выбрана');
-
         const index = Number(data.slice('pick:'.length));
         const song = session.searchResults[index];
 
@@ -613,7 +675,6 @@ async function handleCallbackQuery(callbackQuery) {
     }
 
     if (data === 'action:translate') {
-        await telegram.answerCallbackQuery(callbackQuery.id, 'Начинаю перевод');
         await runSongAction(chatId, 'translate', {
             targetLanguage: 'русский',
         });
@@ -621,17 +682,18 @@ async function handleCallbackQuery(callbackQuery) {
     }
 
     if (data === 'action:explain_song') {
-        await telegram.answerCallbackQuery(callbackQuery.id, 'Начинаю разбор');
         await runSongAction(chatId, 'explain_song');
         return;
     }
 
     if (data === 'action:deep_explain') {
-        await telegram.answerCallbackQuery(callbackQuery.id, 'Начинаю разбор');
         await runSongAction(chatId, 'deep_explain');
+        return;
     }
 
-    await telegram.answerCallbackQuery(callbackQuery.id);
+    if (data === 'action:credits') {
+        await runSongAction(chatId, 'credits');
+    }
 }
 
 async function handleUpdate(update) {
