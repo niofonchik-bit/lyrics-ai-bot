@@ -145,6 +145,8 @@ function renderSources(sources) {
         return '';
     }
 
+    return '';
+
     const links = sources
         .map((source, index) => (
             `${index + 1}. ${createLink(source.title || source.url, source.url)}`
